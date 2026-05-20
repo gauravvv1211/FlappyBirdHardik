@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Flappy MI — Cricket Meri Jaan</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    width: 100%;
+    background: #04101f;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  #game {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: pointer;
+  }
+  #credits {
+    position: fixed;
+    bottom: 6px;
+    left: 0;
+    width: 100%;
+    text-align: center;
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 13px;
+    letter-spacing: 1px;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+    pointer-events: none;
+    z-index: 5;
+  }
+  #loading {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #ffd24c;
+    font-size: 24px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    background: #04101f;
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="loading">LOADING…</div>
+  <footer id="credits">Made by Ayush and Gaurav</footer>
+
+<script>
+"use strict";
+
+(function () {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const loadingEl = document.getElementById("loading");
+
+  // ---- Background music ----
+  const bgm = new Audio("assets/bgm.mp3");
+  bgm.loop = true;
+  bgm.volume = 0.6;
+  let musicStarted = false;
+
+  // ---- Game-over sound ----
+  const sfxDead = new Audio("assets/gameover.m4a");
+  sfxDead.volume = 0.9;
+  function playDeadSound() {
+    try { sfxDead.currentTime = 0; sfxDead.play().catch(function () {}); } catch (e) {}
+  }
+
+  function startMusic() {
+    if (musicStarted) return;
+    musicStarted = true;
+    // play() returns a promise that rejects if blocked; ignore safely.
+    const p = bgm.play();
+    if (p && p.catch) p.catch(function () { musicStarted = false; });
+  }
+
+  // ---- Load images ----
+  const assets = {
+    bg:   "assets/bg.png",     // Cricket Meri Jaan banner (background)
+    bird: "assets/bird.png",   // Hardik (the player)
+    pipe: "assets/pipe.png"    // Rohit (the obstacles)
+  };
+  const img = {};
+  let toLoad = Object.keys(assets).length;
+  let started = false;
+
+  for (const key in assets) {
+    const im = new Image();
+    im.onload = function () {
+      if (--toLoad === 0) startGame();
+    };
+    im.onerror = function () {
+      // Fail-safe: still start even if an asset is missing.
+      if (--toLoad === 0) startGame();
+    };
+    im.src = assets[key];
+    img[key] = im;
+  }
+
+  // ---- Layout (recomputed on resize) ----
+  let W, H, BIRD_X, PIPE_GAP, GROUND_HEIGHT;
+
+  function computeLayout() {
+    W = canvas.width = Math.floor(window.innerWidth);
+    H = canvas.height = Math.floor(window.innerHeight);
+    BIRD_X = Math.max(140, Math.floor(W * 0.18));
+    PIPE_GAP = Math.min(330, Math.max(210, Math.floor(H * 0.30)));
+    GROUND_HEIGHT = Math.max(70, Math.floor(H * 0.10));
+  }
+  window.addEventListener("resize", function () {
+    computeLayout();
+    if (bird) bird.y = Math.min(bird.y, H - GROUND_HEIGHT - BIRD_R);
+  });
+  computeLayout();
+
+  // ---- Tunable constants ----
+  const GRAVITY = 0.55;
+  const FLAP_VELOCITY = -9.3;
+  const MAX_FALL_SPEED = 15;
+  const PIPE_SPEED = 3.4;
+  const PIPE_WIDTH = 95;
+  const PIPE_SPACING = 360;     // horizontal distance between pipes
+  const BIRD_R = 30;
+
+  // ---- Game state machine ----
+  const State = { READY: "ready", PLAYING: "playing", DEAD: "dead" };
+  let state;
+  let bird;
+  let pipes;
+  let groundOffset;
+  let score;
+  let best = loadBest();
+  let frame;
+  let deadAtFrame = 0;
+
+  function loadBest() {
+    try {
+      const v = parseInt(localStorage.getItem("flappyMIBest") || "0", 10);
+      return Number.isFinite(v) ? v : 0;
+    } catch (e) { return 0; }
+  }
+  function saveBest() {
+    try { localStorage.setItem("flappyMIBest", String(best)); } catch (e) {}
+  }
+
+  function reset() {
+    state = State.READY;
+    bird = { y: H / 2, vy: 0, rotation: 0 };
+    pipes = [];
+    groundOffset = 0;
+    score = 0;
+    frame = 0;
+    spawnPipe(W + 120);
+    // Resume the background song from the start on a fresh game.
+    if (musicStarted) {
+      try { bgm.currentTime = 0; bgm.play().catch(function () {}); } catch (e) {}
+    }
+  }
+
+  function spawnPipe(x) {
+    const minTop = 70;
+    const maxTop = H - GROUND_HEIGHT - PIPE_GAP - 70;
+    const top = minTop + Math.random() * Math.max(40, maxTop - minTop);
+    pipes.push({ x: x, top: top, scored: false });
+  }
+
+  function flap() {
+    if (state === State.READY) {
+      state = State.PLAYING;
+      bird.vy = FLAP_VELOCITY;
+    } else if (state === State.PLAYING) {
+      bird.vy = FLAP_VELOCITY;
+    } else if (state === State.DEAD) {
+      if (frame - deadAtFrame > 12) reset();
+    }
+  }
+
+  function die() {
+    if (state !== State.PLAYING) return;
+    state = State.DEAD;
+    deadAtFrame = frame;
+    bgm.pause();          // stop background song
+    playDeadSound();      // play game-over sound
+    if (score > best) { best = score; saveBest(); }
+  }
+
+  // ---- Input ----
+  function onTap(e) { if (e) e.preventDefault(); startMusic(); flap(); }
+  canvas.addEventListener("mousedown", onTap);
+  canvas.addEventListener("touchstart", onTap, { passive: false });
+  window.addEventListener("keydown", function (e) {
+    if (e.code === "Space" || e.code === "ArrowUp" || e.key === " ") {
+      e.preventDefault();
+      startMusic();
+      flap();
+    }
+  });
+
+  // ---- Update ----
+  function update() {
+    frame++;
+    groundOffset = (groundOffset + PIPE_SPEED) % 48;
+
+    if (state === State.READY) {
+      bird.y = H / 2 + Math.sin(frame / 18) * 8;
+      bird.rotation = 0;
+      return;
+    }
+
+    if (state === State.PLAYING) {
+      bird.vy = Math.min(bird.vy + GRAVITY, MAX_FALL_SPEED);
+      bird.y += bird.vy;
+      const target = Math.max(-0.5, Math.min(1.3, bird.vy / 12));
+      bird.rotation += (target - bird.rotation) * 0.2;
+
+      for (const p of pipes) {
+        p.x -= PIPE_SPEED;
+        if (!p.scored && p.x + PIPE_WIDTH < BIRD_X - BIRD_R) {
+          p.scored = true;
+          score++;
+        }
+      }
+      while (pipes.length && pipes[0].x + PIPE_WIDTH < 0) pipes.shift();
+
+      const last = pipes[pipes.length - 1];
+      if (!last || last.x < W - PIPE_SPACING) {
+        spawnPipe((last ? last.x : W) + PIPE_SPACING);
+      }
+      checkCollisions();
+    }
+
+    if (state === State.DEAD) {
+      bird.vy = Math.min(bird.vy + GRAVITY, MAX_FALL_SPEED);
+      bird.y += bird.vy;
+      const floor = H - GROUND_HEIGHT - BIRD_R;
+      if (bird.y > floor) { bird.y = floor; bird.vy = 0; }
+      bird.rotation = Math.min(1.6, bird.rotation + 0.08);
+    }
+  }
+
+  function checkCollisions() {
+    if (bird.y - BIRD_R < 0) { bird.y = BIRD_R; bird.vy = 0; }
+    if (bird.y + BIRD_R >= H - GROUND_HEIGHT) {
+      bird.y = H - GROUND_HEIGHT - BIRD_R;
+      die();
+      return;
+    }
+    // Slightly forgiving hitbox (80% radius) so it feels fair.
+    const r = BIRD_R * 0.8;
+    for (const p of pipes) {
+      const inX = BIRD_X + r > p.x && BIRD_X - r < p.x + PIPE_WIDTH;
+      if (!inX) continue;
+      if (bird.y - r < p.top || bird.y + r > p.top + PIPE_GAP) {
+        die();
+        return;
+      }
+    }
+  }
+
+  // ---- Render helpers ----
+  // Draw an image to cover a rect (object-fit: cover), clipped, with vertical anchor.
+  function drawCover(image, x, y, w, h, vAlign) {
+    if (!image || !image.complete || !image.naturalWidth) {
+      ctx.fillStyle = "#0a4b8c";
+      ctx.fillRect(x, y, w, h);
+      return;
+    }
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    const scale = Math.max(w / image.naturalWidth, h / image.naturalHeight);
+    const dw = image.naturalWidth * scale;
+    const dh = image.naturalHeight * scale;
+    const ox = x + (w - dw) / 2;
+    let oy;
+    if (vAlign === "bottom") oy = y + h - dh;
+    else if (vAlign === "top") oy = y;
+    else oy = y + (h - dh) / 2;
+    ctx.drawImage(image, ox, oy, dw, dh);
+    ctx.restore();
+  }
+
+  function drawBackground() {
+    drawCover(img.bg, 0, 0, W, H, "center");
+    // Dark overlay so gameplay elements stay readable.
+    ctx.fillStyle = "rgba(4,16,31,0.30)";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawPipes() {
+    for (const p of pipes) {
+      const gapBottom = p.top + PIPE_GAP;
+      // Upper obstacle (anchored bottom → face shows near the gap).
+      drawCover(img.pipe, p.x, 0, PIPE_WIDTH, p.top, "bottom");
+      // Lower obstacle (anchored top).
+      drawCover(img.pipe, p.x, gapBottom, PIPE_WIDTH, H - GROUND_HEIGHT - gapBottom, "top");
+      // Edge frames.
+      ctx.strokeStyle = "#0b2a52";
+      ctx.lineWidth = 4;
+      ctx.strokeRect(p.x, 0, PIPE_WIDTH, p.top);
+      ctx.strokeRect(p.x, gapBottom, PIPE_WIDTH, H - GROUND_HEIGHT - gapBottom);
+      // Gap lips (MI blue/gold).
+      ctx.fillStyle = "#ffb81c";
+      ctx.fillRect(p.x - 5, p.top - 12, PIPE_WIDTH + 10, 12);
+      ctx.fillRect(p.x - 5, gapBottom, PIPE_WIDTH + 10, 12);
+    }
+  }
+
+  function drawGround() {
+    const gy = H - GROUND_HEIGHT;
+    ctx.fillStyle = "#0a3a6b";
+    ctx.fillRect(0, gy, W, GROUND_HEIGHT);
+    ctx.fillStyle = "#ffb81c";
+    ctx.fillRect(0, gy, W, 6);
+    ctx.fillStyle = "#0d4d8c";
+    for (let x = -groundOffset; x < W; x += 48) {
+      ctx.fillRect(x, gy + 12, 24, GROUND_HEIGHT - 12);
+    }
+  }
+
+  function drawBird() {
+    ctx.save();
+    ctx.translate(BIRD_X, bird.y);
+    ctx.rotate(bird.rotation);
+    // Circular clip for the face.
+    ctx.beginPath();
+    ctx.arc(0, 0, BIRD_R, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.save();
+    ctx.clip();
+    if (img.bird && img.bird.complete && img.bird.naturalWidth) {
+      const s = Math.max((BIRD_R * 2) / img.bird.naturalWidth, (BIRD_R * 2) / img.bird.naturalHeight);
+      const dw = img.bird.naturalWidth * s;
+      const dh = img.bird.naturalHeight * s;
+      ctx.drawImage(img.bird, -dw / 2, -dh / 2, dw, dh);
+    } else {
+      ctx.fillStyle = "#f7d51d";
+      ctx.fillRect(-BIRD_R, -BIRD_R, BIRD_R * 2, BIRD_R * 2);
+    }
+    ctx.restore();
+    // Ring border.
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "#ffb81c";
+    ctx.beginPath();
+    ctx.arc(0, 0, BIRD_R, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function text(str, x, y, size, color, align) {
+    ctx.font = "bold " + size + "px 'Segoe UI', sans-serif";
+    ctx.textAlign = align || "center";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = Math.max(4, size / 7);
+    ctx.strokeStyle = "rgba(0,0,0,0.6)";
+    ctx.strokeText(str, x, y);
+    ctx.fillStyle = color;
+    ctx.fillText(str, x, y);
+  }
+
+  function drawScore() {
+    text(String(score), W / 2, 90, 64, "#fff");
+  }
+
+  function drawReady() {
+    text("FLAPPY MI", W / 2, H / 2 - 120, 64, "#ffd24c");
+    text("Cricket Meri Jaan", W / 2, H / 2 - 60, 28, "#fff");
+    text("Click / Space to flap", W / 2, H / 2 + 140, 26, "#fff");
+    text("Best: " + best, W / 2, H / 2 + 180, 22, "#ffd24c");
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawDead() {
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0, 0, W, H);
+    const boxW = 360, boxH = 220;
+    const bx = (W - boxW) / 2, by = (H - boxH) / 2 - 20;
+    ctx.fillStyle = "#0a3a6b";
+    roundRect(bx, by, boxW, boxH, 16); ctx.fill();
+    ctx.strokeStyle = "#ffb81c"; ctx.lineWidth = 5;
+    roundRect(bx, by, boxW, boxH, 16); ctx.stroke();
+
+    text("GAME OVER", W / 2, by + 44, 38, "#ffd24c");
+    text("Score", W / 2 - 80, by + 110, 22, "#cfe2f7");
+    text(String(score), W / 2 - 80, by + 145, 44, "#fff");
+    text("Best", W / 2 + 80, by + 110, 22, "#cfe2f7");
+    text(String(best), W / 2 + 80, by + 145, 44, "#fff");
+    text("Click / Space to play again", W / 2, by + boxH + 36, 22, "#fff");
+  }
+
+  function render() {
+    drawBackground();
+    drawPipes();
+    drawGround();
+    drawBird();
+    if (state === State.READY) drawReady();
+    else if (state === State.PLAYING) drawScore();
+    else if (state === State.DEAD) { drawScore(); drawDead(); }
+  }
+
+  // ---- Fixed-timestep main loop ----
+  let lastTime = 0, acc = 0;
+  const STEP = 1000 / 60;
+  function loop(now) {
+    requestAnimationFrame(loop);
+    if (!lastTime) lastTime = now;
+    let delta = now - lastTime;
+    lastTime = now;
+    if (delta > 250) delta = 250;
+    acc += delta;
+    while (acc >= STEP) { update(); acc -= STEP; }
+    render();
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      lastTime = 0;
+      bgm.pause();
+    } else if (musicStarted) {
+      bgm.play().catch(function () {});
+    }
+  });
+
+  function startGame() {
+    if (started) return;
+    started = true;
+    loadingEl.style.display = "none";
+    reset();
+    requestAnimationFrame(loop);
+  }
+
+  // Safety: if image events somehow never fire, start after 4s anyway.
+  setTimeout(startGame, 4000);
+})();
+</script>
+</body>
+</html>
